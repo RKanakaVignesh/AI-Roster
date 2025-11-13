@@ -1,0 +1,463 @@
+
+"""
+Generates an optimal monthly employee shift roster using Gurobi solver.
+Requirements:
+  pip install gurobipy pandas python-dateutil openpyxl
+Usage example:
+  python gurobi_roster_v4.py --num_employees 20 --year 2025 --month 11
+"""
+import gurobipy as gp
+from gurobipy import GRB
+import argparse
+from datetime import date, timedelta
+from typing import List, Dict, Any
+import pandas as pd
+from dateutil.relativedelta import relativedelta
+# Global constants
+SHIFTS = ['G', '1', '2', '3', 'WO', 'PH']
+def month_date_range(year: int, month: int) -> List[date]:
+    start = date(year, month, 1)
+    end = (start + relativedelta(months=1)) - timedelta(days=1)
+    return [start + timedelta(days=i) for i in range((end - start).days + 1)]
+def is_weekend(d: date) -> bool:
+    return d.weekday() >= 5
+def build_and_solve(employees: List[str], year: int, month: int,
+                   public_holidays=[], solver_time_limit_seconds=3600,
+                   template_rows: List[Dict[str, str]] = None,
+                   enforce_template_hard: bool = False,
+                   distribution: str = '70_30'):
+    days = month_date_range(year, month)
+    D = len(days)
+    E = len(employees)
+    
+    model = gp.Model("Employee_Roster")
+    model.setParam('TimeLimit', solver_time_limit_seconds)
+    model.setParam('Threads', 8)
+    # Variables
+    x = {}
+    for ei, e in enumerate(employees):
+        for di, d in enumerate(days):
+            for s in SHIFTS:
+                x[ei, di, s] = model.addVar(vtype=GRB.BINARY, name=f"x_{ei}_{di}_{s}")
+    # Initialize objective terms list
+    obj_terms = []
+    # If a template is provided, we will create mismatch variables (for soft) or enforce hard equality
+    template_mismatch_vars = []
+    # Build a lookup for template rows: map (employee_name, date_iso) -> shift
+    template_map = {}
+    if template_rows:
+        for r in template_rows:
+            en = r.get('EmployeeName')
+            dt = r.get('Date')
+            sh = r.get('Shift')
+            if en and dt and sh:
+                template_map[(en.strip(), dt.strip())] = sh.strip()
+    # Basic Constraints
+    for ei in range(E):
+        for di in range(D):
+            model.addConstr(gp.quicksum(x[ei, di, s] for s in SHIFTS) == 1)
+    # Daily Coverage
+    for di, d in enumerate(days):
+        daily_shifts = {s: gp.quicksum(x[ei, di, s] for ei in range(E)) for s in SHIFTS}
+        is_ph = d.isoformat() in public_holidays
+        if is_ph or is_weekend(d):
+            # Weekend/PH staffing - exactly one engineer per shift
+            model.addConstr(daily_shifts['1'] == 1)  # Exactly 1 in shift 1
+            model.addConstr(daily_shifts['2'] == 1)  # Exactly 1 in shift 2
+            model.addConstr(daily_shifts['3'] == 1)  # Exactly 1 in shift 3
+            model.addConstr(daily_shifts['G'] == 0)  # No G shifts on weekends
+            
+            if is_ph:
+                model.addConstr(daily_shifts['WO'] == 0)
+                model.addConstr(daily_shifts['PH'] == E - 3)  # Rest are on PH
+            else:
+                model.addConstr(daily_shifts['PH'] == 0)
+                model.addConstr(daily_shifts['WO'] == E - 3)  # Rest are on WO
+        else:
+            # Weekday staffing
+            # On Fridays, require exactly 2 people in shift 3 (user request)
+            if d.weekday() == 4:  # Friday (Mon=0..Sun=6)
+                model.addConstr(daily_shifts['3'] == 2)
+            # Target of two engineers in shifts 1 and 3, allow deviations in both directions
+            deviation_1 = model.addVar(name=f"deviation_1_{di}")  # How far from 2 we are
+            deviation_3 = model.addVar(name=f"deviation_3_{di}")  # How far from 2 we are
+            model.addConstr(deviation_1 >= daily_shifts['1'] - 2)   # Track absolute deviation
+            model.addConstr(deviation_1 >= 2 - daily_shifts['1'])
+            model.addConstr(deviation_3 >= daily_shifts['3'] - 2)   # Track absolute deviation
+            model.addConstr(deviation_3 >= 2 - daily_shifts['3'])
+            obj_terms.append(2000 * (deviation_1 + deviation_3))  # High penalty for deviations            # No public-holiday assignments on weekdays
+            model.addConstr(daily_shifts['PH'] == 0)
+            # Ensure at least one in shift 2 (covers edge cases when very few employees)
+            model.addConstr(daily_shifts['2'] >= 1)
+            # Distribute the remaining staff (after 1 and 3 and WO/PH) between G and 2
+            # according to the chosen ratio (70/30 or 60/40). We allow wider integer
+            # tolerance to improve feasibility.
+            if distribution == '60_40':
+                ratio_G = 0.6
+            else:
+                ratio_G = 0.7
+            ratio_2 = 1.0 - ratio_G
+            remaining_expr = E - daily_shifts['1'] - daily_shifts['3'] - daily_shifts['WO'] - daily_shifts['PH']
+            
+            # G/2 ratio deviation variables (to track and penalize deviations)
+            g_deviation = model.addVar(name=f"g_dev_{di}")  # How far from ratio target
+            s2_deviation = model.addVar(name=f"s2_dev_{di}")  # How far from ratio target
+            
+            # Compute target numbers
+            g_target = ratio_G * remaining_expr
+            s2_target = ratio_2 * remaining_expr
+            
+            # Allow more deviation (±2) but track and penalize it
+            model.addConstr(g_deviation >= daily_shifts['G'] - g_target)   # Track absolute deviation
+            model.addConstr(g_deviation >= g_target - daily_shifts['G'])
+            model.addConstr(daily_shifts['G'] >= g_target - 3)            # But with wider bounds
+            model.addConstr(daily_shifts['G'] <= g_target + 3)
+            
+            model.addConstr(s2_deviation >= daily_shifts['2'] - s2_target)  # Track absolute deviation  
+            model.addConstr(s2_deviation >= s2_target - daily_shifts['2'])
+            model.addConstr(daily_shifts['2'] >= s2_target - 3)           # But with wider bounds
+            model.addConstr(daily_shifts['2'] <= s2_target + 3)
+            
+            # Add ratio deviation penalties to objective
+            obj_terms.append(1000 * (g_deviation + s2_deviation))
+    # Max consecutive shifts
+    for ei in range(E):
+        for di in range(D - 5):
+            work_days = gp.quicksum(
+                x[ei, di + k, s]
+                for k in range(6)
+                for s in ['1', 'G', '2', '3']
+            )
+            model.addConstr(work_days <= 5)
+        for di in range(D - 3):
+            night_shifts = gp.quicksum(x[ei, di + k, '3'] for k in range(4))
+            model.addConstr(night_shifts <= 3)
+    # Weekly off limit: an employee must not receive more WO+PH in any week
+    # than the number of weekend days (Sat+Sun) plus public holidays in that week.
+    # Use week starting on Saturday to match the provided sheet (Sat-Fri)
+    week_start_index = 5  # Saturday (Mon=0..Sun=6)
+    for di, d in enumerate(days):
+        delta = (d.weekday() - week_start_index) % 7
+        wk_start = d - timedelta(days=delta)
+        weeks.setdefault(wk_start.isoformat(), []).append(di)
+    # Keep weekly cap constraints (soft enforcement will be added per-month below)
+    for wk_start, indices in weeks.items():
+        weekend_count = sum(1 for di in indices if is_weekend(days[di]))
+        ph_count = sum(1 for di in indices if days[di].isoformat() in public_holidays)
+        max_offs = weekend_count + ph_count
+        for ei in range(E):
+            model.addConstr(gp.quicksum(x[ei, di, 'WO'] + x[ei, di, 'PH'] for di in indices) <= max_offs)
+    # Enforce (softly) that over the whole month each employee receives the same
+    # number of offs (WO+PH). The user requested equal week-off counts (Saturday+Sunday
+    # plus public holidays in the month). We add per-employee deviation variables and
+    # penalize deviations in the objective so the solver prefers equal offs while
+    # keeping feasibility more likely than a hard equality.
+    weekend_count_month = sum(1 for d in days if is_weekend(d))
+    ph_count_month = sum(1 for d in days if d.isoformat() in public_holidays)
+    target_monthly_offs = weekend_count_month + ph_count_month
+    month_off_devs = []
+    for ei in range(E):
+        total_offs = gp.quicksum(x[ei, di, 'WO'] + x[ei, di, 'PH'] for di in range(D))
+        dev = model.addVar(name=f"month_off_dev_{ei}")
+        month_off_devs.append(dev)
+        model.addConstr(dev >= total_offs - target_monthly_offs)
+        model.addConstr(dev >= target_monthly_offs - total_offs)
+        # Penalize deviations heavily so roster strives to give equal offs to everyone
+        obj_terms.append(5000 * dev)
+    # Shift sequence rules - more flexible based on actual roster
+    sequence_violations = []
+    for ei in range(E):
+        for di in range(D - 1):
+            # Hard constraints - avoid problematic transitions
+            model.addConstr(x[ei, di, '3'] + x[ei, di + 1, '1'] <= 1)  # No 3->1
+            model.addConstr(x[ei, di, '3'] + x[ei, di + 1, '2'] <= 1)  # No 3->2
+            # No 2->1 transitions per user request (after 2nd shift, 1st shift should not come)
+            model.addConstr(x[ei, di, '2'] + x[ei, di + 1, '1'] <= 1)  # No 2->1
+            
+            # After 3rd shift, must take WO or continue 3rd (limited by consecutive constraint)
+            model.addConstr(x[ei, di, '3'] <= x[ei, di + 1, '3'] + x[ei, di + 1, 'WO'] + x[ei, di + 1, 'PH'])
+            # Soft preferences for transitions
+            for s1, s2 in [('1', 'G'), ('G', '2'), ('2', '3')]:
+                v = model.addVar(vtype=GRB.BINARY)
+                sequence_violations.append(v)
+                model.addConstr(x[ei, di, s1] <= x[ei, di + 1, s2] + x[ei, di + 1, 'WO'] + x[ei, di + 1, 'PH'] + v)
+    # Apply template constraints (hard or soft)
+    if template_map:
+        name_to_index = {employees[i]: i for i in range(len(employees))}
+        for (ename, dstr), tshift in template_map.items():
+            if ename not in name_to_index:
+                # ignore template entries for employees not in current list
+                continue
+            ei = name_to_index[ename]
+            try:
+                di = days.index(date.fromisoformat(dstr))
+            except Exception:
+                # try numeric day in month
+                try:
+                    daynum = int(dstr)
+                    di = daynum - 1
+                    if di < 0 or di >= D:
+                        continue
+                except Exception:
+                    continue
+            if tshift not in SHIFTS:
+                continue
+            if enforce_template_hard:
+                model.addConstr(x[ei, di, tshift] == 1)
+            else:
+                m = model.addVar(vtype=GRB.BINARY, name=f"mismatch_{ei}_{di}")
+                # mismatch == 1 <=> assigned shift != tshift
+                # since exactly one shift is assigned per day, mismatch = 1 - x[ei,di,tshift]
+                model.addConstr(m == 1 - x[ei, di, tshift])
+                template_mismatch_vars.append(m)
+    # Balance workload and enforce shift limits
+    max_paid_shifts = 12  # Target number of paid shifts (2nd or 3rd) per employee
+    for ei in range(E):
+        # Paid shifts (2nd and 3rd) should be close to target
+        paid_shifts = gp.quicksum(x[ei, di, s] for di in range(D) for s in ['2', '3'])
+        model.addConstr(paid_shifts >= max_paid_shifts - 2)  # Allow more flexibility
+        model.addConstr(paid_shifts <= max_paid_shifts + 2)
+        
+    # Balance between 2nd and 3rd shifts to ensure fair money distribution
+    shifts_2 = gp.quicksum(x[ei, di, '2'] for di in range(D))
+    shifts_3 = gp.quicksum(x[ei, di, '3'] for di in range(D))
+    # Ensure roughly equal distribution relative to that employee's paid_shifts
+    # (use paid_shifts variable defined above). This avoids forcing an absolute
+    # minimum across all employees which can exceed the total available night
+    # shifts and cause infeasibility.
+    model.addConstr(shifts_2 >= 0.35 * paid_shifts)  # At least 35% of this employee's paid shifts are 2nd
+    model.addConstr(shifts_3 >= 0.35 * paid_shifts)  # At least 35% of this employee's paid shifts are 3rd
+    # Prevent too many high-paying night shifts for the employee
+    model.addConstr(shifts_3 <= 0.65 * paid_shifts)  # Cap night shifts at 65% of this employee's paid shifts
+    # Encourage continuous shift sequences
+    sequence_rewards = []
+    for ei in range(E):
+        for di in range(D - 4):  # Look ahead 5 days
+            # For each shift type that can be continuous (G, 2, 3)
+            for shift in ['G', '2', '3']:
+                # Count continuous shifts in the next 5 days
+                continuous = gp.quicksum(x[ei, di + k, shift] for k in range(5))
+                # Create reward variable for continuous sequences
+                reward = model.addVar(vtype=GRB.BINARY)
+                sequence_rewards.append(reward)
+                # reward = 1 if we get 4+ days of the same shift
+                model.addConstr(continuous >= 4 - 4 * (1 - reward))  # At least 4 days to get reward
+    # Stronger preference: reward full-week (7-day) continuous runs (if possible)
+    week_rewards = []
+    for ei in range(E):
+        for di in range(D - 6):
+            for shift in ['G', '2', '3']:
+                continuous7 = gp.quicksum(x[ei, di + k, shift] for k in range(7))
+                r7 = model.addVar(vtype=GRB.BINARY)
+                week_rewards.append(r7)
+                # r7 = 1 only if all 7 days in window are same shift
+                model.addConstr(continuous7 >= 7 * r7)
+    # Objective: collect terms into the pre-declared obj_terms list
+    obj_terms.append(1000 * gp.quicksum(sequence_violations))
+    obj_terms.append(-500 * gp.quicksum(sequence_rewards))  # Reward continuous sequences
+    # Reward full-week continuous runs more strongly
+    try:
+        obj_terms.append(-800 * gp.quicksum(week_rewards))
+    except NameError:
+        pass
+    # If template mismatches exist (soft mode), penalize them
+    if template_mismatch_vars:
+        obj_terms.append(5000 * gp.quicksum(template_mismatch_vars))
+    model.setObjective(gp.quicksum(obj_terms), GRB.MINIMIZE)
+    print(f"Solving with Gurobi ({E} employees, {D} days)...")
+    model.optimize()
+    if model.status == GRB.INFEASIBLE:
+        print("Model is infeasible — computing IIS and writing 'infeasible.iis'...")
+        try:
+            model.computeIIS()
+            # print a short human-readable IIS summary
+            print('\nConstraints in IIS:')
+            for c in model.getConstrs():
+                try:
+                    if c.iisConstr:
+                        print('  ', c.constrName)
+                        try:
+                            row = model.getRow(c)
+                            print('     expr:', row)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            print('\nVariables in IIS (lb/ub issues):')
+            for v in model.getVars():
+                try:
+                    if v.iisLB or v.iisUB:
+                        print('  ', v.varName, 'lb' if v.iisLB else '', 'ub' if v.iisUB else '')
+                except Exception:
+                    pass
+            # attempt to write IIS to file (try multiple extensions)
+            wrote = False
+            for fname in ('infeasible.iis', 'infeasible.ilp', 'infeasible.sol'):
+                try:
+                    model.write(fname)
+                    print('Wrote IIS to', fname)
+                    wrote = True
+                    break
+                except Exception:
+                    continue
+            if not wrote:
+                print('Could not write IIS to disk (writer unsupported).')
+        except Exception as e:
+            print('Failed to compute IIS or list elements:', e)
+        return pd.DataFrame(columns=["EmployeeName", "Date", "Shift"])
+    if model.status not in [GRB.OPTIMAL, GRB.TIME_LIMIT]:
+        print(" No solution found (status code: ", model.status, ")")
+        return pd.DataFrame(columns=["EmployeeName", "Date", "Shift"])
+    rows = []
+    for ei, e in enumerate(employees):
+        for di, d in enumerate(days):
+            for s in SHIFTS:
+                if x[ei, di, s].x > 0.5:
+                    rows.append({'EmployeeName': e, 'Date': d.isoformat(), 'Shift': s})
+                    break
+    return pd.DataFrame(rows)
+def main():
+    parser = argparse.ArgumentParser(description="Generate an optimal monthly employee shift roster.")
+    parser.add_argument("--num_employees", type=int, required=True)
+    parser.add_argument("--year", type=int, required=True)
+    parser.add_argument("--month", type=int, required=True, choices=range(1, 13))
+    parser.add_argument("--public_holidays", nargs='*', default=[])
+    parser.add_argument("--solver_time_limit", type=int, default=3600)
+    parser.add_argument("--template_csv", type=str, default=None,
+                        help="Optional roster template CSV (long format EmployeeName,Date,Shift OR wide format with day columns)")
+    parser.add_argument("--enforce_template_hard", action='store_true',
+                        help="If set, template assignments are enforced as hard constraints. Otherwise they are soft and penalized in objective.")
+    parser.add_argument("--distribution", type=str, choices=['70_30', '60_40'], default='70_30',
+                        help="Distribution of remaining staff between G and 2 on weekdays. Options: '70_30' (default) or '60_40'.")
+    args = parser.parse_args()
+    template_rows = None
+    employees = None
+    if args.template_csv:
+        try:
+            df = pd.read_csv(args.template_csv)
+        except Exception as e:
+            print(f"Error reading template CSV: {e}")
+            return
+        # Normalize column names
+        cols = [c.strip() for c in df.columns]
+        df.columns = cols
+        # Long format: EmployeeName, Date, Shift
+        if set(['EmployeeName', 'Date', 'Shift']).issubset(set(cols)):
+            template_rows = df[['EmployeeName', 'Date', 'Shift']].to_dict('records')
+            employees = list(dict.fromkeys([r['EmployeeName'] for r in template_rows]))
+        else:
+            # Assume wide format: first column is employee name, rest are day numbers or day labels
+            first_col = cols[0]
+            emp_names = df[first_col].astype(str).tolist()
+            day_cols = cols[1:]
+            template_rows = []
+            for i, en in enumerate(emp_names):
+                for j, dc in enumerate(day_cols):
+                    val = str(df.iloc[i, j+1]).strip()
+                    if val == 'nan' or val == '':
+                        continue
+                    # map column to date
+                    try:
+                        daynum = int(dc)
+                    except Exception:
+                        # try to parse as day label -> use position j
+                        daynum = j + 1
+                    try:
+                        d = date(args.year, args.month, daynum)
+                    except Exception:
+                        continue
+                    template_rows.append({'EmployeeName': en, 'Date': d.isoformat(), 'Shift': val})
+            employees = emp_names
+    if not employees:
+        employees = [f'Employee_{i+1}' for i in range(args.num_employees)]
+    out_df = build_and_solve(
+        employees=employees,
+        year=args.year,
+        month=args.month,
+        public_holidays=args.public_holidays,
+        solver_time_limit_seconds=args.solver_time_limit,
+        template_rows=template_rows,
+        enforce_template_hard=args.enforce_template_hard
+        ,distribution=args.distribution
+    )
+    if not out_df.empty:
+        pivot_df = out_df.pivot(index='EmployeeName', columns='Date', values='Shift').fillna('')
+        pivot_df = pivot_df.reindex(sorted(pivot_df.columns), axis=1)
+        
+        print("\nSample Roster (first 10 employees):")
+        print(pivot_df.head(10).to_string())
+        excel_out_path = "gurobioutput.xlsx"
+        sheet_name = date(args.year, args.month, 1).strftime('%b %Y')
+        try:
+            with pd.ExcelWriter(excel_out_path, engine='openpyxl') as writer:
+                # Write main roster
+                pivot_df.to_excel(writer, sheet_name=sheet_name, index=True, startrow=1)
+                
+                from openpyxl.styles import PatternFill
+                worksheet = writer.sheets[sheet_name]
+                
+                # Formatting
+                yellow_fill = PatternFill(start_color="FFFFFF00", end_color="FFFFFF00", fill_type="solid")
+                green_fill = PatternFill(start_color="FFC6EFCE", end_color="FFC6EFCE", fill_type="solid")
+                blue_fill = PatternFill(start_color="FFBDE2FF", end_color="FFBDE2FF", fill_type="solid")
+                
+                # Add day names
+                worksheet.insert_rows(2)
+                for col_idx, value in enumerate(pivot_df.columns, 2):
+                    worksheet.cell(row=1, column=col_idx).fill = yellow_fill
+                    day_date = date.fromisoformat(value)
+                    day_cell = worksheet.cell(row=2, column=col_idx, value=day_date.strftime('%a'))
+                    day_cell.fill = green_fill
+                # Color WO cells
+                for row in worksheet.iter_rows(min_row=3, max_row=worksheet.max_row, min_col=2):
+                    for cell in row:
+                        if cell.value == 'WO':
+                            cell.fill = blue_fill
+                # Daily summary
+                dates = sorted(pivot_df.columns)
+                daily_summary = []
+                for d in dates:
+                    day_shifts = pivot_df[d].value_counts()
+                    daily_summary.append({
+                        'Date': d,
+                        'Day': date.fromisoformat(d).strftime('%a'),
+                        '1': day_shifts.get('1', 0),
+                        'G': day_shifts.get('G', 0),
+                        '2': day_shifts.get('2', 0),
+                        '3': day_shifts.get('3', 0),
+                        'WO': day_shifts.get('WO', 0)
+                    })
+                daily_df = pd.DataFrame(daily_summary)
+                daily_df.to_excel(writer, sheet_name=sheet_name, 
+                                startrow=len(pivot_df) + 4, index=False)
+                # Employee summary
+                summary_cols = ['WO+PH', 'L', 'G', '1', '2', '3', 'Total Shifts', 
+                              'Weekend Work', 'Amount (2)', 'Amount (3)', 'Shift Amount']
+                
+                summary_df = pd.crosstab(index=out_df['EmployeeName'], columns=out_df['Shift'])
+                for col in ['1', 'G', '2', '3', 'WO', 'PH']:
+                    if col not in summary_df.columns:
+                        summary_df[col] = 0
+                out_df['Date_obj'] = pd.to_datetime(out_df['Date'])
+                weekend_work = out_df[
+                    (out_df['Date_obj'].dt.weekday >= 5) & 
+                    (~out_df['Shift'].isin(['WO', 'PH']))
+                ].groupby('EmployeeName').size()
+                summary_df['Weekend Work'] = weekend_work.reindex(summary_df.index, fill_value=0)
+                summary_df['WO+PH'] = summary_df['WO'] + summary_df.get('PH', 0)
+                summary_df['L'] = 0
+                summary_df['Total Shifts'] = summary_df['2'] + summary_df['3']
+                summary_df['Amount (2)'] = summary_df['2'] * 200
+                summary_df['Amount (3)'] = summary_df['3'] * 400
+                summary_df['Shift Amount'] = summary_df['Amount (2)'] + summary_df['Amount (3)']
+                summary_df = summary_df[summary_cols]
+                summary_df.to_excel(writer, sheet_name=sheet_name,
+                                  startrow=1, startcol=len(pivot_df.columns) + 2)
+            print(f"\n Roster saved to: {excel_out_path}")
+            
+        except Exception as e:
+            print(f"\n Error saving to Excel: {e}")
+    else:
+        print("No roster was generated.")
+if __name__ == "__main__":
+    main()
